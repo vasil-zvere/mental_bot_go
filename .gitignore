@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.out
+
+# Go build
+/bin/
+/build/
+dist/
+
+# Go test
+*.test
+coverage.out
+
+# Vendor
+vendor/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Local config / secrets
+secrets.json
+config.local.json
+credentials.json
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
