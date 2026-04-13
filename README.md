@@ -174,7 +174,6 @@ $env:VK_GROUP_ID="123456789"
 
 ### Что можно доработать
 
-- полностью вынести кнопки и меню в JSON;
 - добавить постоянное хранение состояния;
 - подключить webhook вместо long polling;
 - добавить новые темы тестов;
@@ -355,7 +354,6 @@ This is normal for local launch. The project only works while:
 
 ### What can be improved
 
-- completely remove the buttons and menu in JSON;
 - add persistent state storage;
 - connect a webhook instead of long polling;
 - add new test topics;
