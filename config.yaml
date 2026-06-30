@@ -1,0 +1,17 @@
+telegram:
+  token: ""
+
+vk:
+  token: ""
+  group_id: 0
+  api_version: "5.199"
+
+database:
+  path: "bot_history.db"
+
+logging:
+  dir: "./logs"
+  base_name: "mentalbot"
+
+notifier:
+  inactive_days: 3

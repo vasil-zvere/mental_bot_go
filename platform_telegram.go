@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -15,6 +18,8 @@ import (
 type TelegramClient struct {
 	token      string
 	engine     *Engine
+	history    *HistoryStore
+	reports    *ReportService
 	httpClient *http.Client
 	offset     int64
 }
@@ -50,10 +55,12 @@ type tgSendMessageRequest struct {
 	ReplyMarkup json.RawMessage `json:"reply_markup,omitempty"`
 }
 
-func NewTelegramClient(token string, engine *Engine) *TelegramClient {
+func NewTelegramClient(token string, engine *Engine, history *HistoryStore, reports *ReportService) *TelegramClient {
 	return &TelegramClient{
 		token:      token,
 		engine:     engine,
+		history:    history,
+		reports:    reports,
 		httpClient: &http.Client{Timeout: 35 * time.Second},
 	}
 }
@@ -81,9 +88,78 @@ func (c *TelegramClient) Run(ctx context.Context) error {
 			if upd.Message == nil || upd.Message.Text == "" {
 				continue
 			}
+
 			chatID := strconv.FormatInt(upd.Message.Chat.ID, 10)
+			sessionKey := "telegram:" + chatID
+			before := c.engine.sessions.Get(sessionKey)
+			themeKey, state, questionIndex, score, resultLevel := snapshotFromSession(before, c.engine.content)
+
+			_ = c.history.SaveMessage(HistoryMessage{
+				Platform:      "telegram",
+				ChatID:        chatID,
+				Direction:     "incoming",
+				MessageText:   upd.Message.Text,
+				SentAt:        time.Now(),
+				ThemeKey:      themeKey,
+				State:         state,
+				QuestionIndex: questionIndex,
+				Score:         score,
+				ResultLevel:   resultLevel,
+			})
+
+			if isMyReportCommand(upd.Message.Text) {
+				reportPath, err := c.reports.GenerateUserReport("telegram", chatID)
+				if err != nil {
+					_ = c.sendMessage(ctx, upd.Message.Chat.ID, OutgoingMessage{
+						Text:    "Не удалось сформировать отчет. Проверь, есть ли история диалога и шрифт DejaVuSans.ttf.",
+						Buttons: mainMenuButtons(),
+					})
+					continue
+				}
+
+				if err := c.sendDocument(ctx, upd.Message.Chat.ID, reportPath, "Ваш персональный PDF-отчет готов."); err != nil {
+					_ = c.sendMessage(ctx, upd.Message.Chat.ID, OutgoingMessage{
+						Text:    "Не удалось отправить PDF-отчет.",
+						Buttons: mainMenuButtons(),
+					})
+				}
+				_ = os.Remove(reportPath)
+				continue
+			}
+
+			if isDeleteHistoryCommand(upd.Message.Text) {
+				if err := c.history.DeleteUserHistory("telegram", chatID); err != nil {
+					_ = c.sendMessage(ctx, upd.Message.Chat.ID, OutgoingMessage{
+						Text:    "Не удалось удалить историю.",
+						Buttons: mainMenuButtons(),
+					})
+				} else {
+					_ = c.sendMessage(ctx, upd.Message.Chat.ID, OutgoingMessage{
+						Text:    "Ваша история диалога удалена.",
+						Buttons: mainMenuButtons(),
+					})
+				}
+				continue
+			}
+
 			responses := c.engine.HandleInput("telegram", chatID, upd.Message.Text)
+			after := c.engine.sessions.Get(sessionKey)
+			themeKey, state, questionIndex, score, resultLevel = snapshotFromSession(after, c.engine.content)
+
 			for _, resp := range responses {
+				_ = c.history.SaveMessage(HistoryMessage{
+					Platform:      "telegram",
+					ChatID:        chatID,
+					Direction:     "outgoing",
+					MessageText:   resp.Text,
+					SentAt:        time.Now(),
+					ThemeKey:      themeKey,
+					State:         state,
+					QuestionIndex: questionIndex,
+					Score:         score,
+					ResultLevel:   resultLevel,
+				})
+
 				if err := c.sendMessage(ctx, upd.Message.Chat.ID, resp); err != nil {
 					log.Printf("telegram sendMessage error: %v", err)
 				}
@@ -179,4 +255,56 @@ func buildTelegramKeyboard(buttons [][]string) (json.RawMessage, error) {
 	kb := tgKeyboard{Keyboard: rows, ResizeKeyboard: true, OneTimeKeyboard: false}
 	b, err := json.Marshal(kb)
 	return json.RawMessage(b), err
+}
+
+func (c *TelegramClient) sendDocument(ctx context.Context, chatID int64, filePath, caption string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	if err := writer.WriteField("chat_id", strconv.FormatInt(chatID, 10)); err != nil {
+		return err
+	}
+	if caption != "" {
+		if err := writer.WriteField("caption", caption); err != nil {
+			return err
+		}
+	}
+
+	part, err := writer.CreateFormFile("document", filepath.Base(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return err
+	}
+
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", c.token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("telegram sendDocument HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }

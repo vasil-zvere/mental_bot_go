@@ -23,6 +23,9 @@ type Session struct {
 	CurrentQ      int
 	Score         int
 	AwaitingStart bool
+	ABCDraft               ABCDraft
+	WellbeingDraft         WellbeingDraft
+	AwaitingDeleteConfirm  bool
 }
 
 type SessionStore struct {
@@ -64,6 +67,9 @@ type OutgoingMessage struct {
 type Engine struct {
 	content  *ContentStore
 	sessions *SessionStore
+	abc        *ABCStore
+	wellbeing  *WellbeingStore
+	eraser     *DataEraser
 }
 
 func NewEngine(content *ContentStore) *Engine {
@@ -73,6 +79,18 @@ func NewEngine(content *ContentStore) *Engine {
 	}
 }
 
+func (e *Engine) SetABCStore(store *ABCStore) {
+	e.abc = store
+}
+
+func (e *Engine) SetWellbeingStore(store *WellbeingStore) {
+	e.wellbeing = store
+}
+
+func (e *Engine) SetDataEraser(eraser *DataEraser) {
+	e.eraser = eraser
+}
+
 func normalize(s string) string {
 	s = strings.TrimSpace(strings.ToLower(s))
 	s = strings.ReplaceAll(s, "ё", "е")
@@ -80,11 +98,21 @@ func normalize(s string) string {
 }
 
 func mainMenuButtons() [][]string {
-	return [][]string{{"Начать тест", "FAQ"}, {"О боте", "Выйти"}}
+	return [][]string{
+		{"Начать тест", "FAQ"},
+		{"О боте", "Скачать мой отчет"},
+		{"💬 Самочувствие", "📓 Дневник ABC"},
+		{"📊 Моя статистика", "📋 Сводка дневника"},
+		{"Удалить мои данные"},
+	}
 }
 
 func afterResultButtons() [][]string {
-	return [][]string{{"Пройти тест повторно", "Выбрать другую тему"}, {"FAQ", "Выйти"}}
+	return [][]string{
+		{"Пройти тест повторно", "Выбрать другую тему"},
+		{"FAQ", "Скачать мой отчет"},
+		{"Выйти"},
+	}
 }
 
 func backButtons() [][]string {
@@ -113,9 +141,11 @@ func (e *Engine) HandleInput(platform, chatID, rawText string) []OutgoingMessage
 		sess.ThemeKey = ""
 		sess.CurrentQ = 0
 		sess.Score = 0
+		sess.ABCDraft.State = ABCStateIdle
+		sess.WellbeingDraft.State = WBStateIdle
 
 		return []OutgoingMessage{{
-			Text:    "Привет. Я помогу пройти короткий психологический мини-тест, показать предварительный результат, материалы по теме и подсказать, что можно сделать прямо сейчас.",
+			Text:    "Привет. Я помогу пройти короткий психологический мини-тест, показать предварительный результат, материалы по теме и подсказать, что можно сделать прямо сейчас.\n\nТакже ты можешь вести 📓 Дневник ABC или поделиться самочувствием через 💬 Самочувствие.",
 			Buttons: mainMenuButtons(),
 		}}
 	}
@@ -125,12 +155,68 @@ func (e *Engine) HandleInput(platform, chatID, rawText string) []OutgoingMessage
 		return []OutgoingMessage{exitMessage()}
 	}
 
+	// ── Удаление данных пользователя ───────────────────────────────────────
+	if e.eraser != nil {
+		if msgs, handled := HandleDeleteMyData(platform, chatID, text, sess, e.eraser); handled {
+			return msgs
+		}
+	}
+
+	// ── Самочувствие ─────────────────────────────────────────────────────────
+	if e.wellbeing != nil {
+		if norm == normalize("💬 Самочувствие") {
+			sess.WellbeingDraft.State = WBStateIdle
+			return []OutgoingMessage{{
+				Text:    "💬 *Самочувствие*\n\nЗдесь ты можешь рассказать, как себя чувствуешь, и разобраться вместе, что происходит.\n\nЧто хочешь сделать?",
+				Buttons: wbMenuButtons(),
+			}}
+		}
+
+		if msgs, handled := HandleWellbeing(platform, chatID, text, sess, &sess.WellbeingDraft, e.wellbeing); handled {
+			return msgs
+		}
+	}
+
+	// ── ABC-дневник ──────────────────────────────────────────────────────────
+	if e.abc != nil {
+		// Кнопка входа в дневник из главного меню
+		if norm == normalize("📓 Дневник ABC") {
+			sess.ABCDraft.State = ABCStateIdle
+			return []OutgoingMessage{{
+				Text:    "📓 *Дневник ABC*\n\nДневник помогает анализировать события, реакции и мысли по методике когнитивно-поведенческой терапии.\n\nЧто хочешь сделать?",
+				Buttons: abcMenuButtons(),
+			}}
+		}
+
+		if msgs, handled := HandleABC(platform, chatID, text, sess, &sess.ABCDraft, e.abc); handled {
+			return msgs
+		}
+	}
+
 	if norm == "faq" {
 		return []OutgoingMessage{{Text: e.content.FAQText, Buttons: backButtons()}}
 	}
 
 	if norm == normalize("О боте") || norm == normalize("Подробнее о боте") {
 		return []OutgoingMessage{{Text: e.content.AboutText, Buttons: backButtons()}}
+	}
+
+	// ── Сводка дневника ABC за 7 дней ────────────────────────────────────────
+	if norm == normalize("📋 Сводка дневника") {
+		if e.abc == nil {
+			return []OutgoingMessage{{Text: "Дневник ABC недоступен.", Buttons: mainMenuButtons()}}
+		}
+		entries, _ := e.abc.LoadAll(platform, chatID)
+		return []OutgoingMessage{{Text: FormatABCSummary(entries), Buttons: mainMenuButtons()}}
+	}
+
+	// ── Статистика самочувствия за 7 дней ────────────────────────────────────
+	if norm == normalize("📊 Моя статистика") {
+		if e.wellbeing == nil {
+			return []OutgoingMessage{{Text: "Статистика недоступна.", Buttons: mainMenuButtons()}}
+		}
+		entries, _ := e.wellbeing.LoadAll(platform, chatID)
+		return []OutgoingMessage{{Text: FormatWellbeingStat(entries), Buttons: mainMenuButtons()}}
 	}
 
 	if norm == normalize("Начать заново") || norm == normalize("Выбрать другую тему") {
